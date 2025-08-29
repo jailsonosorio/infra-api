@@ -1,73 +1,115 @@
 const express = require("express");
+const oracledb = require("oracledb");
 const app = express();
+// 🔥 Importa a função de db.js
+const { getConnection } = require("./db"); 
 
 app.use(express.json());
 
-// Rota principal
-app.post("/consultaInfraestrutura", (req, res) => {
+app.post("/consultaInfraestrutura", async (req, res) => {
   const { p_tipo, p_instancia } = req.body.consultaInfraestrutura;
 
-  // Apenas para debug
   console.log(`Tipo: ${p_tipo}, Instancia: ${p_instancia}`);
 
   let response;
 
-  // Retorno mockado baseado no tipo
-  if (p_tipo === "estado") {
-    response = {
-      status: `Base de dados ${p_instancia} OPEN com ${
-        Math.floor(Math.random() * 50) + 1
-      } Sessão Ativo e consumindo ${(Math.random() * 200).toFixed(2)} MB de PGA`,
-    };
-  } else if (p_tipo === "capacidade") {
-    response = [
-      {
-        name: "DATA",
-        type: "NORMAL",
-        state: "CONNECTED",
-        totalSizeGB: 3000,
-        usedSpaceGB: 2873,
-        freeSpaceGB: 128,
-        usedPercentage: 95.76,
-      },
-      {
-        name: "FRA",
-        type: "EXTERN",
-        state: "MOUNTED",
-        totalSizeGB: 500,
-        usedSpaceGB: 448,
-        freeSpaceGB: 53,
-        usedPercentage: 89.53,
-      },
-    ];
-  } else if (p_tipo === "anomalia") {
-    response = [
-      {
-        name: "FNOS1",
-        allocatedMB: 35,
-        freeMb: 5,
-        usedMb: 30,
-        pctFree: 13,
-        pctUsed: 87,
-        maxBytesMb: 32768,
-        maxFreeBytesMb: 32738,
-      },
-      {
-        name: "DBPLUS",
-        allocatedMB: 1000,
-        freeMB: 436,
-        usedMB: 564,
-        pctFree: 44,
-        pctUsed: 56,
-        maxBytesMb: 1000,
-        maxFreeBytesMb: 436,
-      },
-    ];
-  } else {
-    response = { error: "Tipo de consulta inválido!" };
-  }
 
-  res.json(response);
+  try {
+    const conn = await getConnection();
+
+    if (p_tipo === "estado") {
+      const result = await conn.execute(
+        `SELECT instance_name, status, database_status, logins, host_name
+          FROM v$instance
+          where instance_name = :instancia`,
+        [p_instancia],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      response = result.rows;
+    }
+
+    else if (p_tipo === "capacidade") {
+      const result = await conn.execute(
+        `select * from (
+          select
+          t.tablespace as name,
+          t.status,
+          t.totalspace as totalSizeGB,
+          round((t.totalspace-fs.freespace),2) as usedSpaceGB,
+          fs.freespace as freeSpaceGB,
+          round(((t.totalspace-fs.freespace)/t.totalspace)*100,2) as usedPercentage,
+          round((fs.freespace/t.totalspace)*100,2) as freeSpaceGBperc
+          from
+          (select round(sum(d.bytes)/(1024*1024)) as totalspace,
+          d.tablespace_name tablespace,
+          d.status
+          from
+          dba_data_files d group by d.tablespace_name, d.status
+          ) t,
+          (select round(sum(f.bytes)/(1024*1024)) as freespace,
+          f.tablespace_name tablespace
+          from dba_free_space f group by f.tablespace_name) fs
+          where
+          t.tablespace=fs.tablespace
+          order by usedPercentage desc)
+          where rownum < 11`,
+        [],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      response = result.rows;
+    }
+
+    else if (p_tipo === "anomalia") {
+      const result = await conn.execute(
+        `select * from (
+          select
+          t.tablespace as Name,
+          t.totalspace as allocatedMB,
+          round((t.totalspace-fs.freespace),2) as usedSpaceMB,
+          fs.freespace as freeSpaceMB,
+          round(t.MAXBYTES/1024/1024/1024,2) MAXSIZE_GB,
+          (t.INCREMENT_BY*8)/1024 INCR_MB,
+          round(((t.totalspace-fs.freespace)/t.totalspace)*100,2) as usedPercentage,
+          round((fs.freespace/t.totalspace)*100,2) as freeSpacePerc
+          from
+          (select round(sum(d.bytes)/(1024*1024)) as totalspace,
+          d.tablespace_name tablespace,
+          d.status,
+          d.MAXBYTES,
+          d.INCREMENT_BY
+          from
+          dba_data_files d
+          group by d.tablespace_name, d.status, d.MAXBYTES, d.INCREMENT_BY
+          ) t,
+          (select round(sum(f.bytes)/(1024*1024)) as freespace,
+          f.tablespace_name tablespace
+          from dba_free_space f group by f.tablespace_name) fs
+          where
+          t.tablespace=fs.tablespace
+          and round(((t.totalspace-fs.freespace)/t.totalspace)*100,2) > 95
+          --order by t.tablespace
+          order by usedPercentage desc)
+          where rownum < 11`,
+        [],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      response = result.rows;
+    }
+
+    else {
+      response = { error: "Tipo de consulta inválido!" };
+    }
+
+    await conn.close();
+    res.json(response);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Erro ao consultar a base de dados" });
+  }
 });
 
 // Iniciar servidor
